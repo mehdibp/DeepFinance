@@ -37,17 +37,38 @@ def fetch_MT5_data(symbol: str, timeframe: int, date_from: datetime, date_to: da
         print(f"initialize() failed, error code = {mt5.last_error()}")
         mt5.shutdown()
     else:
-        
-        rates = mt5.copy_rates_range(symbol, timeframe, date_from, date_to)
-        
-        if rates is not None and len(rates) > 0:
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            df.to_csv(f'{timeframe} ({date_from} -- {date_to}).csv'.replace(" 00:00:00+00:00", ""), index=False)
+
+        ranges = [(date_from, date_to)]     # List of intervals
+        dfs = []
+
+        max_splits = 5
+        # As long as we have a range and the number of divisions does not exceed the allowed limit
+        while ranges and max_splits > 0:    
+            new_ranges = []
+            for start, end in ranges:
+                rates = mt5.copy_rates_range(symbol, timeframe, start, end)
+
+                if rates is not None and len(rates) > 0:
+                    df = pd.DataFrame(rates)
+                    df['time'] = pd.to_datetime(df['time'], unit='s')
+                    dfs.append(df)
+                else:
+                    # If no data is returned, halve the interval
+                    mid = start + (end - start) / 2
+                    new_ranges.append((start, mid))
+                    new_ranges.append((mid, end))
+
+            ranges = new_ranges
+            max_splits -= 1
+
+        mt5.shutdown()
+
+        if dfs:
+            final_df = pd.concat(dfs).drop_duplicates().sort_values(by="time").reset_index(drop=True)
+            temp_date = final_df['time'].dt.date
+            final_df.to_csv(f'{symbol} -- {timeframe} ({temp_date[0]} - {temp_date.values[-1]}).csv', index=False)
         else:
             print(f"Failed to fetch data or no data found. Error: {mt5.last_error()}")
-            
-        mt5.shutdown()
 
 
 # -------------------------------------------------------------------------------------------
@@ -109,6 +130,14 @@ def level_features(df: pd.DataFrame, period: list[pd.Series], atr_window: int=14
     df['dist_round']        = round_distance (df, digits=digits)
     df[f'trend_{ema_span}'] = add_trend      (df, ema_span=ema_span)
     for p in period: df[f'dist_shadow_prev_{p.name}'] = shadow_distance(df, period=p, atr_window=atr_window)
+    
+    ### 
+    if 'dist_shadow_prev_None' in df.columns:
+      df = df.rename(columns={"dist_shadow_prev_None": "dist_shadow_prev_week"})
+      df = df.dropna(subset=['dist_shadow_prev_week']).reset_index(drop=True)
+    elif 'dist_shadow_prev_time' in df.columns:
+      df = df.dropna(subset=['dist_shadow_prev_time']).reset_index(drop=True)
+    ###
 
     return df
 
@@ -132,10 +161,10 @@ def round_distance(df: pd.DataFrame, digits: int=2):
     df = df.copy()
 
     factor = 10**digits
-    df['dist_high']  = (df['high'] - df['high'].round(digits)) * factor
-    df['dist_low' ]  = (df['low' ] - df['low' ].round(digits)) * factor
+    dist_high = (df['high'] - df['high'].round(digits)) * factor
+    dist_low  = (df['low' ] - df['low' ].round(digits)) * factor
 
-    dist_round = np.minimum(df['dist_high'].abs(), df['dist_low'].abs())
+    dist_round = np.minimum(dist_high.abs(), dist_low.abs())
     return dist_round
 
 def shadow_distance(df: pd.DataFrame, period: list[pd.Series], atr_window: int=14):
@@ -161,18 +190,18 @@ def shadow_distance(df: pd.DataFrame, period: list[pd.Series], atr_window: int=1
     high_close = np.abs(df['high'] - df['close'].shift(1))
     low_close  = np.abs(df['low' ] - df['close'].shift(1))
 
-    df['tr' ] = np.maximum(high_low, np.maximum(high_close, low_close)) # TR
-    df['atr'] = df['tr'].rolling(atr_window).mean()                     # ATR
+    tr  = np.maximum(high_low, np.maximum(high_close, low_close)) 	# TR
+    atr = tr.rolling(atr_window).mean()                     		# ATR
 
     # Maximum and minimum period
     agg = df.groupby(period).agg(ref_high=('high','max'), ref_low=('low','min'))
     df = df.join(agg.shift(1), on=period)               # Add previous period
 
     # Distance of today's shadow from the boundaries of the previous period
-    df['high_to_prev_high'] = (df['high'] - df['ref_high']).abs() / df['atr']
-    df['high_to_prev_low' ] = (df['high'] - df['ref_low' ]).abs() / df['atr']
-    df['low_to_prev_high' ] = (df['low' ] - df['ref_high']).abs() / df['atr']
-    df['low_to_prev_low'  ] = (df['low' ] - df['ref_low' ]).abs() / df['atr']
+    df['high_to_prev_high'] = (df['high'] - df['ref_high']).abs() / atr
+    df['high_to_prev_low' ] = (df['high'] - df['ref_low' ]).abs() / atr
+    df['low_to_prev_high' ] = (df['low' ] - df['ref_high']).abs() / atr
+    df['low_to_prev_low'  ] = (df['low' ] - df['ref_low' ]).abs() / atr
 
     # Minimum shadow distance to previous range
     dist_shadow_prev = df[['high_to_prev_high', 'high_to_prev_low', 'low_to_prev_high', 'low_to_prev_low']].min(axis=1)
@@ -197,8 +226,8 @@ def add_trend(df: pd.DataFrame, ema_span: int=12*12):
 
     df = df.copy()
 
-    df[f'ema_{ema_span}'] = df['close'].ewm(span=ema_span).mean()
-    trend_col = df['close'] / df[f'ema_{ema_span}']
+    ema_values = df['close'].ewm(span=ema_span).mean()
+    trend_col  = df['close'] / ema_values
 
     return trend_col
 
@@ -248,22 +277,17 @@ def normalize_window(df_window: pd.DataFrame):
 
 
 # -------------------------------------------------------------------------------------------
-def target_label (df: pd.DataFrame, 
-                 horizon: int=24, 
-                 regime_threshold: float=1.0,
-                 sl_mult: float=1.0, tp_mult: float=2.0,
-                 price_col: str="close", high_col: str="high", low_col: str="low",
-                 vol_col: str="volatility_20", direction_col: str="market_regime"):
+def target_label (df: pd.DataFrame, horizon: int=24, regime_threshold: float=1.0, sl_mult: float=1.0, tp_mult: float=2.0):
     
     df = df.copy()
 
-    df["market_regime"] = market_regime(df, horizon+6, regime_threshold, price_col, vol_col)
-    df["trade_outcome"] = trade_outcome(df, horizon, sl_mult, tp_mult, direction_col)
-    df["MFE_norm"], df["MAE_norm"] = calc_mfe_mae (df, horizon, price_col, high_col, low_col, vol_col)
+    df["market_regime"] = calc_market_regime(df, horizon+6, regime_threshold)
+    df["trade_outcome"] = calc_trade_outcome(df, horizon, sl_mult, tp_mult)
+    df["MFE_norm"], df["MAE_norm"] = calc_mfe_mae (df, horizon)
 
     return df
 
-def market_regime(df: pd.DataFrame, horizon=30, threshold=1.0, price_col="close", vol_col="volatility_20"):
+def calc_market_regime(df: pd.DataFrame, horizon=30, threshold=1.0):
     """
     Label market regime based on future trend strength.
 
@@ -289,9 +313,9 @@ def market_regime(df: pd.DataFrame, horizon=30, threshold=1.0, price_col="close"
 
     df = df.copy()
 
-    future_close   = df[price_col].shift(-horizon)
-    future_return  = np.log(future_close / df[price_col])   # log(close[t+H] / close[t])
-    trend_strength = future_return / df[vol_col]            # ​log(C_{t+H}​/C_{t}​)​ / volatility_{t}
+    future_close   = df['colse'].shift(-horizon)
+    future_return  = np.log(future_close / df['colse'])     # log(close[t+H] / close[t])
+    trend_strength = future_return / df['volatility_20']    # ​log(C_{t+H}​/C_{t}​)​ / volatility_{t}
 
     # regime labeling: market_regime ∈ {-1, 0, +1} ~= {DownTrend, Range, UpTrend}
     regime = pd.Series(0, index=df.index, name="market_regime")
@@ -300,8 +324,7 @@ def market_regime(df: pd.DataFrame, horizon=30, threshold=1.0, price_col="close"
 
     return regime
 
-def trade_outcome(df: pd.DataFrame, horizon=20, sl_mult=1.0, tp_mult=2.0, direction_col="direction",
-                        price_col="close", high_col="high", low_col="low", vol_col="volatility_20" ):
+def calc_trade_outcome(df: pd.DataFrame, horizon=20, sl_mult=1.0, tp_mult=2.0):
     """
     Label trade outcome based on trade direction, take-profit (TP), and stop-loss (SL).
 
@@ -346,9 +369,9 @@ def trade_outcome(df: pd.DataFrame, horizon=20, sl_mult=1.0, tp_mult=2.0, direct
     for i in range(len(df)):
         if i + horizon >= len(df): outcomes.append(np.nan); continue
 
-        direction = df.loc[i, direction_col]
-        entry     = df.loc[i, price_col]
-        vol       = df.loc[i, vol_col]
+        direction = df.loc[i, 'market_regime']
+        entry     = df.loc[i, 'close']
+        vol       = df.loc[i, 'volatility_20']
 
         if direction == 1:  # BUY
             TP = entry + tp_mult * vol
@@ -356,8 +379,8 @@ def trade_outcome(df: pd.DataFrame, horizon=20, sl_mult=1.0, tp_mult=2.0, direct
 
             result = 0
             for j in range(i+1, i+horizon+1):
-                if df.loc[j, low_col ] <= SL: result = -1; break
-                if df.loc[j, high_col] >= TP: result =  1; break
+                if df.loc[j, 'low' ] <= SL: result = -1; break
+                if df.loc[j, 'high'] >= TP: result =  1; break
 
         elif direction == -1:  # SELL
             TP = entry - tp_mult * vol
@@ -365,15 +388,15 @@ def trade_outcome(df: pd.DataFrame, horizon=20, sl_mult=1.0, tp_mult=2.0, direct
 
             result = 0
             for j in range(i+1, i+horizon+1):
-                if df.loc[j, high_col] >= SL: result = -1; break
-                if df.loc[j, low_col ] <= TP: result =  1; break
+                if df.loc[j, 'high'] >= SL: result = -1; break
+                if df.loc[j, 'low' ] <= TP: result =  1; break
 
         else: result = np.nan
 
         outcomes.append(result)
     return outcomes
 
-def calc_mfe_mae (df: pd.DataFrame, horizon=20, price_col="close", high_col="high", low_col="low", vol_col="volatility_20"):
+def calc_mfe_mae (df: pd.DataFrame, horizon=20):
     """
     Compute and label MFE and MAE for each hypothetical trade.
 
@@ -409,13 +432,13 @@ def calc_mfe_mae (df: pd.DataFrame, horizon=20, price_col="close", high_col="hig
     for i in range(len(df)):
         if i + horizon >= len(df): mfe.append(np.nan); mae.append(np.nan); continue
 
-        entry = df.loc[i, price_col]
+        entry = df.loc[i, 'colse']
 
-        max_high = df.loc[i+1:i+horizon, high_col].max()
-        min_low  = df.loc[i+1:i+horizon, low_col ].min()
+        max_high = df.loc[i+1:i+horizon, 'high'].max()
+        min_low  = df.loc[i+1:i+horizon, 'low' ].min()
 
-        mfe.append((max_high - entry) / df.loc[i, vol_col])
-        mae.append((entry - min_low ) / df.loc[i, vol_col])
+        mfe.append((max_high - entry) / df.loc[i, 'volatility_20'])
+        mae.append((entry - min_low ) / df.loc[i, 'volatility_20'])
     return mfe, mae
 
 
@@ -438,15 +461,6 @@ period = [Datetime.date, Datetime.isocalendar().year.astype(str)+'-'+Datetime.is
 
 data = core_features(data)
 data = level_features(data, period=period, atr_window=14)
-
-### 
-if 'dist_shadow_prev_None' in data.columns:
-    data = data.rename(columns={"dist_shadow_prev_None": "dist_shadow_prev_week"})
-    data = data.dropna(subset=['dist_shadow_prev_week']).reset_index(drop=True)
-elif 'dist_shadow_prev_time' in data.columns:
-    data = data.dropna(subset=['dist_shadow_prev_time']).reset_index(drop=True)
-###
-
 data = target_label(data)
 
 data.to_csv('test_.csv', index=False)
