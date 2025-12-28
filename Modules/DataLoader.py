@@ -11,7 +11,7 @@ class BaseMarketDataset(tf.keras.utils.Sequence):
         self,
         df: pd.DataFrame, feature_cols: list[str],
         window: int = 48, batch_size: int = 32,
-        use_images: bool = False, shuffle: bool = True, indices: np.ndarray | None = None, scaler: StandardScaler | None = None
+        use_images: bool = True, shuffle: bool = True, indices: np.ndarray | None = None, scaler: StandardScaler | None = None
     ):
         """
         Args:
@@ -102,69 +102,57 @@ class BaseMarketDataset(tf.keras.utils.Sequence):
         return (df_window[['open','high','low','close']] - low) / (high - low)
 
 
-# Market Regime Classification (Stage 1) ----------------------------------------------------
-class Stage1MarketDataset(BaseMarketDataset):
-    # ---------------------------------------------------------------------------------------
-    def __getitem__(self, idx):
-        batch_idx = self.indices[idx*self.batch_size:(idx+1)*self.batch_size]
-
-        feature_input, candles_input, outputs = [], [], []
-
-        for i in batch_idx:
-            window_df = self.df.iloc[i:i+self.window]
-
-            # Scale features and append target
-            feature_input.append(self.scaler.transform(window_df[self.feature_cols].values))
-            outputs.append(self.df.iloc[i+self.window]["market_regime"])
-
-            if self.use_images: candles_input.append(self.candle_image(window_df))
-
-        # Format inputs for Multi-modal or Single-modal models
-        if self.use_images: inputs = {"tabular": np.array(feature_input, dtype=np.float32), "image": np.array(candles_input)}
-        else:               inputs = np.array(feature_input, dtype=np.float32)
-        outputs = np.array(outputs, dtype=np.int32)
-
-        return inputs, outputs
-
-
-# Trade Outcome Prediction (Stage 2) --------------------------------------------------------
-class Stage2MarketDataset(BaseMarketDataset):
-    # ---------------------------------------------------------------------------------------
-    def __init__(self, *args, **kwargs):
+# Market Regime Classification & Trade Outcome Prediction -----------------------------------
+class MarketDataset(BaseMarketDataset):
+    def __init__(self, stage_mode: str, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Filter indices where regime is not 0 and trade outcome is valid (-1 or 1)
-        valid_1 = self.df["market_regime"].values[self.indices + self.window] != 0
-        valid_2 = np.isin(self.df["trade_outcome"].values[self.indices + self.window], [-1, 1])
-        self.indices = self.indices[valid_1 & valid_2]
+        self.stage_mode = stage_mode
+        if stage_mode == 'win_probability':
+            # Filter indices where regime is not 0 and trade outcome is valid (-1 or 1)
+            valid_1 = self.df["market_regime"].values[self.indices + self.window] != 0
+            valid_2 = np.isin(self.df["trade_outcome"].values[self.indices + self.window], [-1, 1])
+            self.indices = self.indices[valid_1 & valid_2]
 
-        # Pre-calculate targets for efficiency - 'trade_outcome' (mapped -1 -> 0, 1 -> 1)
-        self._targets = (
-            self.df.iloc[self.indices + self.window]["trade_outcome"].map({-1: 0, 1: 1}).values.astype(np.int32)
-        )
+            # Precalculation of auxiliary inputs for win probability stage
+            self._entry_probs = self.df.iloc[self.indices + self.window]["entry_probability"].values.astype(np.float32)
+            self._directions  = self.df.iloc[self.indices + self.window]["market_regime"]    .values.astype(np.float32)
+
+            # Pre-calculate targets for efficiency - 'trade_outcome' (mapped -1 -> 0, 1 -> 1)
+            self._targets = (self.df.iloc[self.indices + self.window]["trade_outcome"].map({-1: 0, 1: 1}).values.astype(np.int32))
+            
+        elif stage_mode == 'entry_probability': 
+            self._targets = self.df.iloc[self.indices + self.window]["market_regime"].values.astype(np.int32)
+        else:
+            raise RuntimeError(f"StageMode must be 'entry_probability' or 'win_probability'")
 
     # ---------------------------------------------------------------------------------------
     def __getitem__(self, idx):
-        batch_idx = self.indices[idx*self.batch_size:(idx+1)*self.batch_size]
+        start, end = idx*self.batch_size, (idx+1)*self.batch_size
+        batch_indices = self.indices [start:end]
+        batch_targrts = self._targets[start:end]
 
-        feature_input, candles_input, outputs = [], [], []
+        feature_input, candles_input = [], []
 
-        for j, i in enumerate(batch_idx):
+        for i in batch_indices:
             window_df = self.df.iloc[i:i+self.window]
             feature_input.append(self.scaler.transform(window_df[self.feature_cols].values))
-            outputs.append(self._targets[j + idx*self.batch_size])
-
             if self.use_images: candles_input.append(self.candle_image(window_df))
 
-        if self.use_images: inputs = {"tabular": np.array(feature_input, dtype=np.float32), "image": np.array(candles_input)}
-        else:               inputs = np.array(feature_input, dtype=np.float32)
-        outputs = np.array(outputs, dtype=np.int32)
+        inputs = [np.array(feature_input, dtype=np.float32)]
+        if self.use_images: inputs.append(np.array(candles_input, dtype=np.float32))
+        if self.stage_mode == 'win_probability':
+            inputs.append(self._entry_probs[start:end])
+            inputs.append(self._directions [start:end])
+        
+        inputs  = tuple(inputs) if len(inputs) > 1 else tuple(inputs[0])
+        outputs = np.array(batch_targrts, dtype=np.int32)
 
         return inputs, outputs
 
 
 # Splits the dataframe into training, validation, and test indices for time-series ----------
-class DatasetManager:
+class DatasetManager():
     # ---------------------------------------------------------------------------------------
     def __init__(self, df: pd.DataFrame, window: int = 48, split_ratio: tuple=(0.7, 0.15, 0.15)):
         self.df = df.reset_index(drop=True)
@@ -185,10 +173,10 @@ class DatasetManager:
 
 
 
-# ===========================================================================================
+"""
 # USAGE EXAMPLE:
 # ===========================================================================================
-"""
+
 # 1. Load and Clean Data
 data = pd.read_csv('your_file.csv').reset_index(drop=True)
 feature_cols = [
@@ -202,18 +190,10 @@ feature_cols = [
 manager = DatasetManager(data, window=48)
 
 # 3. Create TRAIN dataset (this will FIT the scaler)
-train_ds1 = Stage1MarketDataset(data, feature_cols, indices=manager.train_idx, shuffle=True)
-shared_scaler = train_ds1.scaler                    # Capture the fitted scaler
+train_ds = MarketDataset('win_probability', data, feature_cols, indices=manager.train_idx, shuffle=True)
+shared_scaler = train_ds.scaler                     # Capture the fitted scaler
 
 # 4. Create VAL/TEST datasets (passing the SHARED scaler - only TRANSFORM will happen)
-valid_ds1 = Stage1MarketDataset(data, feature_cols, scaler=shared_scaler, indices=manager.val_idx , shuffle=False)
-test_ds1  = Stage1MarketDataset(data, feature_cols, scaler=shared_scaler, indices=manager.test_idx, shuffle=False)
-
-# 5. Repeat the same steps for stage2.
-train_ds2 = Stage2MarketDataset(data, feature_cols, indices=manager.train_idx, shuffle=True)
-valid_ds2 = Stage2MarketDataset(data, feature_cols, scaler=train_ds2.scaler, indices=manager.val_idx , shuffle=False)
-test_ds2  = Stage2MarketDataset(data, feature_cols, scaler=train_ds2.scaler, indices=manager.test_idx, shuffle=False)
-
-# 6. Use with Keras
-# model.fit(train_ds1, validation_data=valid_ds1, epochs=10)
+valid_ds = MarketDataset('win_probability', data, feature_cols, scaler=shared_scaler, indices=manager.val_idx , shuffle=False)
+test_ds  = MarketDataset('win_probability', data, feature_cols, scaler=shared_scaler, indices=manager.test_idx, shuffle=False)
 """
